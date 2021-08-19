@@ -1,0 +1,320 @@
+include:
+  - remote: 'https://gitlab.freedesktop.org/freedesktop/ci-templates/-/raw/18194044f0f984c8815bc9a1a146582f6bf15d41/templates/fedora.yml'
+  - remote: "https://gitlab.freedesktop.org/freedesktop/ci-templates/-/raw/f830873d69a7ff67a9bd69df2916dd0bb147ce09/templates/ci-fairy.yml"
+
+stages:
+ - review
+ - prepare
+ - build
+ - test
+ - coverage
+
+.mutter.fedora:33@common:
+  variables:
+    FDO_DISTRIBUTION_VERSION: 33
+    BASE_TAG: '2021-02-04.2'
+    FDO_UPSTREAM_REPO: GNOME/mutter
+    FDO_DISTRIBUTION_EXEC: |
+      dnf install -y 'dnf-command(builddep)' &&
+      dnf builddep -y mutter --setopt=install_weak_deps=False &&
+
+      # For running unit tests
+      dnf install -y xorg-x11-server-Xvfb mesa-dri-drivers dbus dbus-x11 \
+                     'pkgconfig(accountsservice)' \
+                     gnome-control-center gcovr libnma python3-gobject \
+                     python3-dbusmock &&
+
+      # GNOME Shell
+      dnf builddep -y gnome-shell --setopt=install_weak_deps=False &&
+      dnf install -y 'pkgconfig(gtk4)' 'pkgconfig(vulkan)' 'pkgconfig(libtirpc)' &&
+      dnf remove -y gnome-bluetooth-libs-devel &&
+      dnf remove -y --noautoremove mutter mutter-devel &&
+
+      # For Xwayland/Xvfb
+      dnf builddep -y xorg-x11-server-Xwayland --setopt=install_weak_deps=False &&
+      dnf remove -y --noautoremove 'xorg-x11-server-Xwayland' &&
+
+      # For glib
+      dnf builddep -y glib2 --setopt=install_weak_deps=False &&
+
+      ./.gitlab-ci/install-meson-project.sh \
+          https://gitlab.gnome.org/GNOME/glib.git \
+          2.67.3 . &&
+
+      ./.gitlab-ci/install-meson-project.sh \
+          -Dlibaudit=disabled \
+          -Dplymouth=disabled \
+          -Dselinux=disabled \
+          -Dxdmcp=disabled \
+          https://gitlab.gnome.org/GNOME/gdm.git \
+          3.38.0 . &&
+
+      ./.gitlab-ci/install-meson-project.sh \
+          https://gitlab.gnome.org/GNOME/gsettings-desktop-schemas.git \
+          40.alpha . &&
+
+      ./.gitlab-ci/install-meson-project.sh \
+          -Dxwayland=true \
+          -Dxwayland_eglstream=true \
+          -D{xorg,xnest,xvfb}=false \
+          -Dvendor_name="Mutter CI" \
+          -D{xdmcp,udev,udev_kms}=false \
+          -Dxcsecurity=true \
+          -Dglamor=true \
+          -D{dri1,dri2}=false \
+          -Ddri3=true \
+          https://gitlab.freedesktop.org/xorg/xserver.git \
+          master \
+          . \
+          a9269808f394955f213e34303c2c14fd61c35ab5 &&
+
+      ./.gitlab-ci/install-meson-project.sh \
+          -Dalsa=false \
+          -Dbluez5=false \
+          -Dexamples=false \
+          -Dgstreamer=false \
+          -Djack=false \
+          -Dman=false \
+          -Dpipewire-alsa=false \
+          -Dpipewire-jack=false \
+          -Dsystemd=false \
+          -Dtests=false \
+          https://gitlab.freedesktop.org/pipewire/pipewire.git \
+          0.3.21 . &&
+
+      dnf clean all
+
+default:
+  # Cancel jobs if newer commits are pushed to the branch
+  interruptible: true
+  # Auto-retry jobs in case of infra failures
+  retry:
+    max: 1
+    when:
+      - 'runner_system_failure'
+      - 'stuck_or_timeout_failure'
+      - 'scheduler_failure'
+      - 'api_failure'
+
+.mutter.fedora:33@x86_64:
+  extends: .mutter.fedora:33@common
+  variables:
+    FDO_DISTRIBUTION_TAG: "x86_64-${BASE_TAG}"
+
+.mutter.fedora:33@aarch64:
+  extends: .mutter.fedora:33@common
+  variables:
+    FDO_DISTRIBUTION_TAG: "aarch64-${BASE_TAG}"
+  tags:
+    - aarch64
+
+workflow:
+  rules:
+    - if: '$CI_MERGE_REQUEST_IID'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH'
+
+.pipline-guard: &pipline-guard
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH =~ /^gnome-[0-9-]+$/'
+    - when: 'manual'
+
+check-commit-log:
+  extends:
+    - .fdo.ci-fairy
+  stage: review
+  variables:
+    GIT_DEPTH: "100"
+  script:
+    - if [[ x"$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" != "x" ]] ;
+      then
+        ci-fairy check-commits --junit-xml=commit-message-junit-report.xml ;
+      else
+        echo "Not a merge request" ;
+      fi
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - commit-message-junit-report.xml
+    reports:
+      junit: commit-message-junit-report.xml
+  <<: *pipline-guard
+
+check-merge-request:
+  extends:
+    - .fdo.ci-fairy
+  stage: review
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - if [[ x"$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" != "x" ]] ;
+      then
+        ci-fairy check-merge-request --require-allow-collaboration --junit-xml=check-merge-request-report.xml ;
+      else
+        echo "Not a merge request" ;
+      fi
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - check-merge-request-report.xml
+    reports:
+      junit: check-merge-request-report.xml
+  <<: *pipline-guard
+
+build-fedora-container@x86_64:
+  extends:
+    - .fdo.container-build@fedora@x86_64
+    - .mutter.fedora:33@x86_64
+  stage: prepare
+  needs:
+    - check-commit-log
+    - check-merge-request
+  variables:
+    GIT_STRATEGY: none
+
+build-fedora-container@aarch64:
+  extends:
+    - .fdo.container-build@fedora@aarch64
+    - .mutter.fedora:33@aarch64
+  stage: prepare
+  needs:
+    - check-commit-log
+    - check-merge-request
+  variables:
+    GIT_STRATEGY: none
+
+.build-mutter:
+  extends:
+    - .fdo.distribution-image@fedora
+  stage: build
+  script:
+    - meson . build -Dbuildtype=debugoptimized -Db_coverage=true -Degl_device=true -Dwayland_eglstream=true --werror --prefix /usr
+    - ninja -C build
+    - ninja -C build install
+  artifacts:
+    expire_in: 1 day
+    paths:
+      - build
+
+build-mutter@x86_64:
+  extends:
+    - .build-mutter
+    - .mutter.fedora:33@x86_64
+  needs:
+    - build-fedora-container@x86_64
+
+build-mutter@aarch64:
+  extends:
+    - .build-mutter
+    - .mutter.fedora:33@aarch64
+  needs:
+    - build-fedora-container@aarch64
+
+build-without-opengl-and-glx@x86_64:
+  extends:
+    - .fdo.distribution-image@fedora
+    - .mutter.fedora:33@x86_64
+  stage: build
+  needs:
+    - build-fedora-container@x86_64
+  script:
+    - meson . build -Dbuildtype=debugoptimized -Dopengl=false -Dglx=false -Degl_device=true -Dwayland_eglstream=true --werror --prefix /usr
+    - ninja -C build
+    - ninja -C build install
+  artifacts:
+    paths:
+      - build/meson-logs
+
+build-without-native-backend-and-wayland@x86_64:
+  extends:
+    - .fdo.distribution-image@fedora
+    - .mutter.fedora:33@x86_64
+  stage: build
+  needs:
+    - build-fedora-container@x86_64
+  script:
+    - meson . build -Dbuildtype=debugoptimized -Dnative_backend=false -Dudev=false -Dwayland=false -Dcore_tests=false -Dnative_tests=false --werror --prefix /usr
+    - ninja -C build
+    - ninja -C build install
+  artifacts:
+    paths:
+      - build/meson-logs
+
+.test-mutter:
+  extends:
+    - .fdo.distribution-image@fedora
+  stage: test
+  variables:
+    XDG_RUNTIME_DIR: "$CI_PROJECT_DIR/runtime-dir"
+    GSETTINGS_SCHEMA_DIR: "$CI_PROJECT_DIR/build/data"
+    G_SLICE: "always-malloc"
+    MALLOC_CHECK_: "3"
+    NO_AT_BRIDGE: "1"
+  script:
+    - mkdir -m 700 $XDG_RUNTIME_DIR
+    - dbus-run-session -- bash -x ./.gitlab-ci/run-tests.sh
+  artifacts:
+    expire_in: 1 day
+    reports:
+      junit: "build/${CI_JOB_NAME}-report.xml"
+    name: "mutter-${CI_JOB_NAME}-${CI_COMMIT_REF_NAME}"
+    when: always
+    paths:
+      - build
+
+test-mutter@x86_64:
+  extends:
+    - .test-mutter
+    - .mutter.fedora:33@x86_64
+  needs:
+    - build-mutter@x86_64
+
+test-mutter@aarch64:
+  extends:
+    - .test-mutter
+    - .mutter.fedora:33@aarch64
+  needs:
+    - build-mutter@aarch64
+
+.test-mutter-coverage:
+  extends:
+    - .fdo.distribution-image@fedora
+  stage: coverage
+  script:
+    - ninja -C build coverage
+    - cat build/meson-logs/coverage.txt
+  artifacts:
+    paths:
+      - build/meson-logs/coveragereport
+  coverage: '/^TOTAL.*\s+(\d+\%)$/'
+
+test-mutter-coverage@x86_64:
+  extends:
+    - .test-mutter-coverage
+    - .mutter.fedora:33@x86_64
+  needs:
+    - test-mutter@x86_64
+
+test-mutter-coverage@aarch64:
+  extends:
+    - .test-mutter-coverage
+    - .mutter.fedora:33@aarch64
+  needs:
+    - test-mutter@aarch64
+
+can-build-gnome-shell@x86_64:
+  extends:
+    - .fdo.distribution-image@fedora
+    - .mutter.fedora:33@x86_64
+  stage: test
+  needs:
+    - build-mutter@x86_64
+  before_script:
+    - meson install --no-rebuild -C build
+  script:
+    - .gitlab-ci/checkout-gnome-shell.sh
+    - meson gnome-shell gnome-shell/build --prefix /usr -Dman=false
+    - ninja -C gnome-shell/build install
